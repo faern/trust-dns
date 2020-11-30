@@ -135,8 +135,7 @@ impl RequestHandler for Catalog {
                 }
                 OpCode::Update => {
                     debug!("update received: {}", request_message.id());
-                    // TODO: this should be a future
-                    self.update(&request_message, response_edns, response_handle)
+                    return Box::pin(self.update(request_message, response_edns, response_handle));
                 }
                 c => {
                     warn!("unimplemented op_code: {:?}", c);
@@ -241,12 +240,12 @@ impl Catalog {
     ///
     /// * `request` - an update message
     /// * `response_handle` - sink for the response message to be sent
-    pub fn update<'q, R: ResponseHandler + 'static>(
+    pub fn update<R: ResponseHandler + 'static>(
         &self,
-        update: &'q MessageRequest,
+        update: MessageRequest,
         response_edns: Option<Edns>,
         response_handle: R,
-    ) -> io::Result<()> {
+    ) -> impl Future<Output = ()> + 'static {
         let zones: &[LowerQuery] = update.queries();
 
         // 2.3 - Zone Section
@@ -275,49 +274,54 @@ impl Catalog {
                 .ok_or(ResponseCode::Refused)
         };
 
-        let response_code = match result {
-            Ok(authority) => {
-                // Ask for Master/Slave terms to be replaced
-                #[allow(deprecated)]
-                match authority.zone_type() {
-                    ZoneType::Slave | ZoneType::Master => {
-                        warn!("Consider replacing the usage of master/slave with primary/secondary, see Juneteenth.");
-                    }
-                    _ => (),
-                }
-
-                #[allow(deprecated)]
-                match authority.zone_type() {
-                    ZoneType::Secondary | ZoneType::Slave => {
-                        error!("secondary forwarding for update not yet implemented");
-                        ResponseCode::NotImp
-                    }
-                    ZoneType::Primary | ZoneType::Master => {
-                        let update_result = authority.update(update);
-                        match update_result {
-                            // successful update
-                            Ok(..) => ResponseCode::NoError,
-                            Err(response_code) => response_code,
+        async move {
+            let response_code = match result {
+                Ok(authority) => {
+                    // Ask for Master/Slave terms to be replaced
+                    #[allow(deprecated)]
+                    match authority.zone_type() {
+                        ZoneType::Slave | ZoneType::Master => {
+                            warn!("Consider replacing the usage of master/slave with primary/secondary, see Juneteenth.");
                         }
+                        _ => (),
                     }
-                    _ => ResponseCode::NotAuth,
+
+                    #[allow(deprecated)]
+                    match authority.zone_type() {
+                        ZoneType::Secondary | ZoneType::Slave => {
+                            error!("secondary forwarding for update not yet implemented");
+                            ResponseCode::NotImp
+                        }
+                        ZoneType::Primary | ZoneType::Master => {
+                            let update_result = authority.update(&update);
+                            match update_result {
+                                // successful update
+                                Ok(..) => ResponseCode::NoError,
+                                Err(response_code) => response_code,
+                            }
+                        }
+                        _ => ResponseCode::NotAuth,
+                    }
                 }
+                Err(response_code) => response_code,
+            };
+
+            let response = MessageResponseBuilder::new(None);
+            let mut response_header = Header::default();
+            response_header.set_id(update.id());
+            response_header.set_op_code(OpCode::Update);
+            response_header.set_message_type(MessageType::Response);
+            response_header.set_response_code(response_code);
+
+            let result = send_response(
+                response_edns,
+                response.build_no_records(response_header),
+                response_handle,
+            );
+            if let Err(e) = result {
+                error!("failed to send update response: {}", e);
             }
-            Err(response_code) => response_code,
-        };
-
-        let response = MessageResponseBuilder::new(None);
-        let mut response_header = Header::default();
-        response_header.set_id(update.id());
-        response_header.set_op_code(OpCode::Update);
-        response_header.set_message_type(MessageType::Response);
-        response_header.set_response_code(response_code);
-
-        send_response(
-            response_edns,
-            response.build_no_records(response_header),
-            response_handle,
-        )
+        }
     }
 
     /// Checks whether the `Catalog` contains DNS records for `name`
